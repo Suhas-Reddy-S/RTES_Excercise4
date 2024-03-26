@@ -1,19 +1,3 @@
-/*
-* File: Q5a.cpp
-* Author: Suhas Srinivasa Reddy
-* Date: 24th March 2024
-* 
-* Description: This C++ program is designed for real-time image processing using OpenCV and multithreading with pthreads. It incorporates a variety of image transformations (Canny edge detection, Hough line transformation, and pyramid up/down scaling) on video input from a camera. The code structure includes thread management, synchronization mechanisms (semaphores and mutexes), and real-time scheduling for threads. The main functionalities include:
-* - Capturing video frames from a camera and processing them in separate threads.
-* - Canny edge detection, Hough line detection, and pyramid scaling are implemented in individual threads.
-* - A logging thread calculates and displays the average frame processing rate.
-* - Synchronization using semaphores and mutexes to manage access to shared resources (camera and timing variables).
-* - Real-time scheduling to prioritize the processing threads.
-* - The program can be controlled through command-line arguments to set camera resolution and specify the transformation type.
-* 
-* Note: This program is intended for systems with pthreads and OpenCV installed and is configured for real-time image processing applications.
-*/
-
 #include <iostream>
 #include <pthread.h>
 #include <opencv2/opencv.hpp>
@@ -31,8 +15,11 @@ bool stop_logging = false;
 
 long long totalFrameTime_nsec = 0; // Total time for frames in nanoseconds
 int frameCount = 0;                // Count of frames processed
-int numFramesForAvg = 5;          // Number of frames to average over
+int numFramesForAvg = 20;          // Number of frames to average over
+long double avgExecTime_msec = 1.7;
+int numFramesForAvg_init = 15;
 
+FILE *fpt;
 
 #define ESCAPE_KEY 27
 #define FRAME_DELAY 33  // Frame delay in milliseconds (about 30 frames per second)
@@ -77,6 +64,7 @@ int delta_t(struct timespec *stop, struct timespec *start, struct timespec *delt
 
 void* LoggingThread(void* threadp) {
     struct timespec ts;
+    fprintf(fpt,"Frame no, Execution time, Jitter time\n");
     while (true) {
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 1; // Wait for up to 1 second
@@ -90,17 +78,29 @@ void* LoggingThread(void* threadp) {
         if (sem_trywait(&logSem) == 0) {
             struct timespec elapsedTime;
             delta_t(&endTime, &startTime, &elapsedTime);
-
-            totalFrameTime_nsec += elapsedTime.tv_sec * NSEC_PER_SEC + elapsedTime.tv_nsec;
+            
+            long long frameTime_nsec = elapsedTime.tv_sec * NSEC_PER_SEC + elapsedTime.tv_nsec;
+            long double frameTime_msec = (long double)frameTime_nsec / (1000000);
+            
+            cout <<"Frame: " << frameCount << " Execution time: "<< frameTime_msec << " msec Jitter time:" << avgExecTime_msec - frameTime_msec << " msec" << endl;
+            fprintf(fpt,"%d, %Lf, %Lf\n",frameCount, frameTime_msec, avgExecTime_msec - frameTime_msec);
+            
+            totalFrameTime_nsec += frameTime_nsec;
             frameCount++;
 
             // Calculate and display average framerate every numFramesForAvg frames
-            if (frameCount == numFramesForAvg) {
+            if (frameCount == numFramesForAvg_init) {
                 if (totalFrameTime_nsec > 0) {
-                    double avgTimePerFrame_sec = (double)totalFrameTime_nsec / (numFramesForAvg * NSEC_PER_SEC);
-                    double avgFramerate = 1.0 / avgTimePerFrame_sec;
-                    cout << "Average Framerate: " << avgFramerate << " FPS (Calculated for " << numFramesForAvg << " Frames)" << endl;
+                    long double avgTimePerFrame_msec = (long double)totalFrameTime_nsec / (numFramesForAvg * 1000000);
+                    long double avgFramerate = 1000 / avgTimePerFrame_msec;
+                    cout << endl << "Avergare Execution time: "<< avgTimePerFrame_msec <<"msec Average Framerate: " << avgFramerate << " fps (Calculated for " << numFramesForAvg_init << " Frames)" << endl << endl;
+                    //Update avg excution time to calulate jitter
+                    avgExecTime_msec = avgTimePerFrame_msec;
+                    
+                    // Use avg from fisrt 15 to calculate jitter
+                    numFramesForAvg_init = numFramesForAvg;
                 }
+                
                 // Reset counters
                 totalFrameTime_nsec = 0;
                 frameCount = 0;
@@ -112,7 +112,7 @@ void* LoggingThread(void* threadp) {
 
 void* CannyThread(void* arg) {
     ThreadData* data = static_cast<ThreadData*>(arg);
-    int softDeadlineMS = 100;
+    int PreiodMS = 100;
     cout << "********************Entered Canny Thread********************" <<endl;
     Mat frame, src_gray, detected_edges, dst;
     namedWindow("Edge Map", WINDOW_AUTOSIZE);
@@ -123,10 +123,10 @@ void* CannyThread(void* arg) {
     createTrackbar("Min Threshold:", "Edge Map", &lowThreshold, max_lowThreshold);
     while(true) {
         pthread_mutex_lock(&cameraMutex);
-        clock_gettime(CLOCK_REALTIME, &startTime);
         bool success = data->cam->read(frame);
         pthread_mutex_unlock(&cameraMutex);
-
+        
+        clock_gettime(CLOCK_REALTIME, &startTime);
         if (!success) {
             cerr << "Error: Could not grab a frame" << endl;
             break;
@@ -140,7 +140,7 @@ void* CannyThread(void* arg) {
         imshow("Edge Map", dst);
         clock_gettime(CLOCK_REALTIME, &endTime);
         sem_post(&logSem);
-        char c = (char)waitKey(softDeadlineMS);
+        char c = (char)waitKey(PreiodMS);
         if (c == ESCAPE_KEY) {
             stop_logging = true;
             break;
@@ -152,14 +152,13 @@ void* CannyThread(void* arg) {
 
 void* HoughLinesThread(void* arg) {
     ThreadData* data = static_cast<ThreadData*>(arg);
-    int softDeadlineMS = 200;
+    int PreiodMS = 60;
     cout << "********************Entered Hough Lines Thread********************" <<endl;
     Mat frame, dst, cdst, cdstP;
     namedWindow("Detected Lines", WINDOW_AUTOSIZE);
     
     while(true) {
         pthread_mutex_lock(&cameraMutex);
-        clock_gettime(CLOCK_REALTIME, &startTime);
         bool success = data->cam->read(frame);
         pthread_mutex_unlock(&cameraMutex);
 
@@ -167,7 +166,8 @@ void* HoughLinesThread(void* arg) {
             cerr << "Error: Could not grab a frame" << endl;
             break;
         }
-
+        
+        clock_gettime(CLOCK_REALTIME, &startTime);
         // Convert to grayscale
         cvtColor(frame, frame, COLOR_BGR2GRAY);
 
@@ -192,7 +192,7 @@ void* HoughLinesThread(void* arg) {
         imshow("Detected Lines", cdstP);
         clock_gettime(CLOCK_REALTIME, &endTime);
         sem_post(&logSem);
-        char c = (char)waitKey(softDeadlineMS/200);
+        char c = (char)waitKey(PreiodMS);
         if (c == ESCAPE_KEY) {
             stop_logging = true;
             break;
@@ -203,14 +203,14 @@ void* HoughLinesThread(void* arg) {
 
 void* PyrUpDownThread(void* arg) {
     ThreadData* data = static_cast<ThreadData*>(arg);
-    int softDeadlineMS = 500;
+    int PreiodMS = 500;
     cout << "********************Entered Pyramid Up and Down Thread********************" <<endl;
     Mat frame;
     namedWindow("Pyramids Demo", WINDOW_AUTOSIZE);
 
     while(true) {
         pthread_mutex_lock(&cameraMutex);
-        clock_gettime(CLOCK_REALTIME, &startTime);
+        
         bool success = data->cam->read(frame);
         pthread_mutex_unlock(&cameraMutex);
 
@@ -222,6 +222,7 @@ void* PyrUpDownThread(void* arg) {
         imshow("Pyramids Demo", frame);
 
         char c = (char)waitKey(0); // Wait for a key press
+        clock_gettime(CLOCK_REALTIME, &startTime);
         if (c == ESCAPE_KEY) {
             break;
         } else if (c == 'i') {
@@ -239,35 +240,50 @@ void* PyrUpDownThread(void* arg) {
         imshow("Pyramids Demo", frame); // Redisplay the frame after zoom operation
         clock_gettime(CLOCK_REALTIME, &endTime);
         sem_post(&logSem);
-        waitKey(softDeadlineMS); // Add delay to observe the zoom effect
+        waitKey(PreiodMS); // Add delay to observe the zoom effect
     }
     return nullptr;
 }
 
-int setRealTimeScheduling(int priority) {
+int setRealTimeScheduling(int priority, String sched_policy) {
     struct sched_param sch_params;
-    sch_params.sched_priority = priority;
-    return sched_setscheduler(0, SCHED_FIFO, &sch_params);
+    sch_params.sched_priority = (sched_policy == "SCHED_FIFO") ? priority : 0;
+    if(sched_policy == "SCHED_FIFO") {
+      cout << endl << "Schedule Policy selected: SCHED_FIFO" << endl << endl;
+      return sched_setscheduler(0, SCHED_FIFO, &sch_params);
+    } else {
+      cout << endl << "Schedule Policy selected: SCHED_OTHER" << endl << endl;
+      return sched_setscheduler(0, SCHED_OTHER, &sch_params);
+    }
 }
 
 int main(int argc, char *argv[]) {
     CommandLineParser parser(argc, argv,
                              "{res_w w|640|camera resolution width}"
                              "{res_h h|480|camera resolution height}"
-                             "{CT   |  |continuous transform type}");
+                             "{CT   |  |continuous transform type}"
+                             "{sched_policy   |  |scheduling policy type}");
 
     VideoCapture cam0(0);
     if (!cam0.isOpened()) {
         cerr << "Error: Could not open camera" << endl;
         return -1;
     }
+    
+    fpt = fopen("ContinuousTransform.csv", "w+");
 
     // Initialize the camera mutex
     pthread_mutex_init(&cameraMutex, NULL);
     sem_init(&logSem, 0, 0);
+    
+    cout << endl << "Excercise 4 question 5a:" << endl;
 
-    int width = parser.get<int>("res_w");
-    int height = parser.get<int>("res_h");
+    int width = 640;
+    width = parser.get<int>("res_w");
+    int height = 480;
+    height = parser.get<int>("res_h");
+    
+    cout << endl << "Resolution set to: " << width << "x"<< height << endl;
 
     cam0.set(CAP_PROP_FRAME_WIDTH, width);
     cam0.set(CAP_PROP_FRAME_HEIGHT, height);
@@ -278,7 +294,12 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     
-    if (setRealTimeScheduling(99) != 0) { // 99 is a high priority
+    cout << endl << "Transform selected: " << cmd << endl;
+    
+    String sched_policy = "SCHED_OTHER";
+    sched_policy = parser.get<String>("sched_policy");
+    
+    if (setRealTimeScheduling(99, sched_policy) != 0) { // 99 is a high priority
         cerr << "Failed to set real-time scheduling policy." << endl;
         return -1;
     }
@@ -324,6 +345,7 @@ int main(int argc, char *argv[]) {
 
     pthread_mutex_destroy(&cameraMutex);
     sem_destroy(&logSem);
+    fclose(fpt);
 
     return 0;
 }
